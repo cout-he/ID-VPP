@@ -131,9 +131,12 @@ util = 0.60 + 0.40 * np.clip(np.sin(np.pi * (np.arange(T) - 6) / 14.0), 0, 1)
 
 for t in range(T):
     P_IT_B[t] = it.n_servers * it.P_idle + (it.P_peak - it.P_idle) * util[t] * it.n_servers
-    Q_B[t] = q_dc_required(rec, etp, Tema_target[t], temp_prev, Temo_B[t])
-    P_cool_B[t], P_others_B[t] = p_cool_from_q_dc(etp, it, P_IT_B[t], Q_B[t])
+    Q_target = q_dc_required(rec, etp, Tema_target[t], temp_prev, Temo_B[t])
+    res = p_cool_from_q_dc(etp, it, P_IT_B[t], Q_target)
+    P_cool_B[t], P_others_B[t] = res.P_cool, res.P_others
+    Q_B[t] = res.Q_DC                 # actual net heat consistent with P_cool
     P_DC_B[t] = total_dc_power(P_IT_B[t], P_cool_B[t], P_others_B[t])
+    # forward-recurse with the ACTUAL Q_DC (= natural drift if chiller is off)
     nxt = rec.A @ temp_prev + rec.B * (Temo_B[t] + Q_B[t] * etp.Ra)
     Tema_B[t + 1], Tems_B[t + 1] = nxt
     temp_prev = nxt
@@ -143,13 +146,53 @@ print(f"  P_DC range = {P_DC_B.min()/1000:.3f} - {P_DC_B.max()/1000:.3f} MW (cap
 print(f"  PUE range  = {(P_DC_B/P_IT_B).min():.3f} - {(P_DC_B/P_IT_B).max():.3f}")
 in_band_B = (Tema_B >= lim.Tema_min - 1e-6).all() and (Tema_B <= lim.Tema_max + 1e-6).all()
 print(f"  within [18, 27] degC band: {in_band_B}")
+assert not any(p_cool_from_q_dc(etp, it, P_IT_B[t], q_dc_required(
+    rec, etp, 24.0, np.array([24.0, 24.0]), Temo_B[t])).cooling_off for t in range(T)), \
+    "summer scenario unexpectedly hit chiller-off"
+
+
+# --------------------------------------------------------------------------- #
+# Scenario C — cold winter day, low IT load: chiller-off / natural recursion
+# --------------------------------------------------------------------------- #
+banner("Scenario C) Cold winter day, low load -> chiller off, natural drift")
+# cold outdoor ~2-8 degC; light load ~30% (night-shift / consolidated)
+Temo_C = 5.0 - 3.0 * np.cos(2 * np.pi * (np.arange(T) - 15) / 24.0)
+util_C = np.full(T, 0.30)
+
+Tema_C = np.empty(T + 1); Tems_C = np.empty(T + 1)
+P_IT_C = np.empty(T); P_cool_C = np.empty(T); P_DC_C = np.empty(T)
+off_flags = np.zeros(T, dtype=bool)
+temp_prev = np.array([24.0, 24.0])
+Tema_C[0], Tems_C[0] = temp_prev
+
+for t in range(T):
+    P_IT_C[t] = it.n_servers * it.P_idle + (it.P_peak - it.P_idle) * util_C[t] * it.n_servers
+    Q_target = q_dc_required(rec, etp, 24.0, temp_prev, Temo_C[t])   # ask to hold 24
+    res = p_cool_from_q_dc(etp, it, P_IT_C[t], Q_target)
+    P_cool_C[t], off_flags[t] = res.P_cool, res.cooling_off
+    P_DC_C[t] = total_dc_power(P_IT_C[t], res.P_cool, res.P_others)
+    nxt = rec.A @ temp_prev + rec.B * (Temo_C[t] + res.Q_DC * etp.Ra)  # actual Q_DC
+    Tema_C[t + 1], Tems_C[t + 1] = nxt
+    temp_prev = nxt
+
+nat_ss = steady_state_temp(etp, Temo_C.mean(), (etp.k_IT + 0.10) * P_IT_C.mean())
+print(f"  chiller-off steps: {int(off_flags.sum())}/{T} (expected > 0 in cold/low-load)")
+print(f"  indoor temp min/max = {Tema_C.min():.2f}/{Tema_C.max():.2f} degC")
+print(f"  natural steady state (chiller off) ~ {nat_ss:.2f} degC")
+print("  -> temp drifts BELOW 24 setpoint toward natural SS (correct: with the")
+print("     chiller off it cannot hold setpoint; may exit comfort band -- this is")
+print("     the DR/heating trade-off space Phase 5 optimiser will resolve).")
+assert off_flags.any(), "chiller-off path never exercised; scenario C ineffective"
+assert np.isfinite(Tema_C).all() and Tema_C.max() < 60, "natural recursion diverged"
 
 
 # --------------------------------------------------------------------------- #
 # Plots
 # --------------------------------------------------------------------------- #
-fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+fig, axes = plt.subplots(2, 3, figsize=(17, 8))
+x = np.arange(T)
 
+# --- A) forward recursion -------------------------------------------------- #
 ax = axes[0, 0]
 colors_A = {22.0: "#2980b9", 24.0: "#27ae60", 26.0: "#c0392b"}
 for x0, tr in traj_A.items():
@@ -161,17 +204,33 @@ ax.set_title("A) Forward recursion, $T^o=35^\\circ$C, several $T^a_0$")
 ax.set_xlabel("time (h)"); ax.set_ylabel("indoor air temp ($^\\circ$C)")
 ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
+# --- B) summer temp -------------------------------------------------------- #
 ax = axes[0, 1]
 ax.plot(hours, Tema_B, "o-", color="#2980b9", label="indoor air $T^a$")
 ax.plot(hours, Tems_B, "s--", color="#16a085", ms=4, label="indoor solid $T^s$")
-ax.plot(np.arange(T), Temo_B, "^-", color="#7f8c8d", ms=4, label="outdoor $T^o$")
+ax.plot(x, Temo_B, "^-", color="#7f8c8d", ms=4, label="outdoor $T^o$")
 ax.axhspan(lim.Tema_min, lim.Tema_max, color="green", alpha=0.10)
 ax.set_title("B) Summer day, setpoint-tracking cooling")
 ax.set_xlabel("time (h)"); ax.set_ylabel("temperature ($^\\circ$C)")
 ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
+# --- C) winter temp, chiller-off markers ----------------------------------- #
+ax = axes[0, 2]
+ax.plot(hours, Tema_C, "o-", color="#2980b9", label="indoor air $T^a$")
+ax.plot(hours, Tems_C, "s--", color="#16a085", ms=4, label="indoor solid $T^s$")
+ax.plot(x, Temo_C, "^-", color="#7f8c8d", ms=4, label="outdoor $T^o$")
+off_idx = np.where(off_flags)[0]
+if off_idx.size:
+    ax.plot(off_idx + 1, Tema_C[off_idx + 1], "v", color="#e67e22", ms=8,
+            label="chiller OFF (natural drift)")
+ax.axhline(24.0, color="gray", ls=":", lw=1, label="24 setpoint (not held)")
+ax.axhspan(lim.Tema_min, lim.Tema_max, color="green", alpha=0.10)
+ax.set_title("C) Winter, low load: chiller off -> natural recursion")
+ax.set_xlabel("time (h)"); ax.set_ylabel("temperature ($^\\circ$C)")
+ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+# --- B) power decomposition ------------------------------------------------ #
 ax = axes[1, 0]
-x = np.arange(T)
 ax.stackplot(x, P_IT_B/1000, P_cool_B/1000, P_others_B/1000,
              labels=["$P^{IT}$", "$P^{cool}$", "$P^{others}$"],
              colors=["#3498db", "#e74c3c", "#95a5a6"], alpha=0.85)
@@ -181,11 +240,24 @@ ax.set_title("B) DC load decomposition (eq. 6)")
 ax.set_xlabel("time (h)"); ax.set_ylabel("power (MW)")
 ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.3)
 
+# --- B) PUE & net thermal -------------------------------------------------- #
 ax = axes[1, 1]
 ax.plot(x, P_DC_B/P_IT_B, "o-", color="#8e44ad", label="PUE = $P^{DC}/P^{IT}$")
 ax.plot(x, Q_B/1000, "s--", color="#d35400", ms=4, label="net thermal $Q^{DC}$ (MW)")
 ax.set_title("B) PUE and net thermal power")
 ax.set_xlabel("time (h)"); ax.set_ylabel("PUE  /  MW")
+ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+# --- C) cooling power: zero when chiller off ------------------------------- #
+ax = axes[1, 2]
+ax.plot(x, P_IT_C/1000, "-", color="#3498db", label="$P^{IT}$ (low load)")
+ax.plot(x, P_cool_C/1000, "o-", color="#e74c3c", ms=4, label="$P^{cool}$")
+ax.plot(x, P_DC_C/1000, "k-", lw=2, label="$P^{DC}$")
+if off_idx.size:
+    ax.plot(off_idx, P_cool_C[off_idx]/1000, "v", color="#e67e22", ms=8,
+            label="$P^{cool}=0$ (off)")
+ax.set_title("C) Winter power: cooling drops to 0")
+ax.set_xlabel("time (h)"); ax.set_ylabel("power (MW)")
 ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
 fig.tight_layout()

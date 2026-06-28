@@ -16,6 +16,7 @@ modulus < 1), so the simulation is numerically stable.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,14 +28,32 @@ from .parameters import ETPParams, ITParams
 # IT-equipment power  (Zhao eq. 7-8)
 # --------------------------------------------------------------------------- #
 def p_it_from_utilisation(it: ITParams, u: float, n_on: int | None = None) -> float:
-    """IT power [kW] from CPU utilisation u in [0, u_max].  Eq. (7)."""
+    """IT power [kW] from CPU utilisation u.  Eq. (7).
+
+    Eq. (39) requires 0 <= u <= u_max as a *feasibility constraint*, not a
+    computation step.  This function therefore does NOT silently clip u (that
+    would disguise an infeasible dispatch -- e.g. one needing more active
+    servers -- as a feasible one and pollute later optimisation results).
+    Instead it computes with the true u and emits a warning when u is out of
+    range, leaving the decision to the caller.
+    """
     n_on = it.n_servers if n_on is None else n_on
-    u = float(np.clip(u, 0.0, it.u_max))
+    if u < 0.0 or u > it.u_max:
+        warnings.warn(
+            f"CPU utilisation u={u:.4f} outside feasible [0, {it.u_max}] "
+            f"(eq. 39): dispatch infeasible -- needs more servers or load shift.",
+            RuntimeWarning, stacklevel=2,
+        )
     return n_on * it.P_idle + (it.P_peak - it.P_idle) * u * n_on
 
 
 def p_it_from_workload(it: ITParams, workload: float, n_on: int | None = None) -> float:
-    """IT power [kW] from processed workload E (eq. 8 -> eq. 7)."""
+    """IT power [kW] from processed workload E (eq. 8 -> eq. 7).
+
+    Does not clip: an out-of-range utilisation surfaces as a warning (see
+    p_it_from_utilisation) so infeasible workload/server combinations are
+    visible rather than masked.
+    """
     n_on = it.n_servers if n_on is None else n_on
     u = workload / (n_on * it.mu)
     return p_it_from_utilisation(it, u, n_on)
@@ -149,21 +168,53 @@ def q_dc_required(rec: ETPRecursion, etp: ETPParams,
     return (rhs - Temo_t) / etp.Ra
 
 
-def p_cool_from_q_dc(etp: ETPParams, it: ITParams, P_IT: float, Q_DC: float,
-                     others_ratio: float = 0.10) -> tuple[float, float]:
-    """Solve cooling power and auxiliary power from eq. (10) + the 10% rule.
+@dataclass
+class CoolingResult:
+    """Cooling solution for one step (output of p_cool_from_q_dc)."""
+
+    P_cool: float        # cooling-system electrical power [kW], >= 0
+    P_others: float      # auxiliary electrical power [kW]
+    Q_DC: float          # NET thermal power actually consistent with P_cool [kW]
+    cooling_off: bool    # True if the chiller saturated off (natural drift)
+
+    def __iter__(self):  # back-compat: `P_cool, P_others = result`
+        yield self.P_cool
+        yield self.P_others
+
+
+def p_cool_from_q_dc(etp: ETPParams, it: ITParams, P_IT: float, Q_DC_target: float,
+                     others_ratio: float = 0.10) -> CoolingResult:
+    """Solve cooling power from eq. (10) + the 10% auxiliary rule.
 
     Eq. (10):  Q_DC = k_IT*P_IT + P_others - k_cop*P_cool
     Aux rule:  P_others = others_ratio*(P_IT + P_cool)
-    Solving simultaneously:
-        P_cool = ((k_IT + r)*P_IT - Q_DC) / (k_cop - r)
-    Returns (P_cool, P_others), both clipped at >= 0.
+    Solving simultaneously for the setpoint-tracking target Q_DC_target:
+        P_cool = ((k_IT + r)*P_IT - Q_DC_target) / (k_cop - r)
+
+    If that P_cool >= 0 the chiller can hold the setpoint, and the returned
+    Q_DC equals Q_DC_target (self-consistent with eq. 10 + 10% rule).
+
+    If P_cool < 0 the inverse is demanding "negative cooling" -- physically the
+    room is already shedding heat fast enough (cold outdoor / low load), so no
+    chiller is needed.  Clipping P_cool to 0 while keeping Q_DC_target would
+    break eq. (10): power and temperature would no longer agree.  Instead we
+    turn the chiller OFF (P_cool=0) and return the *natural* net heat
+        Q_DC = k_IT*P_IT + P_others ,  P_others = r*P_IT  (no -k_cop*P_cool term)
+    The caller must forward-recurse with this returned Q_DC (NOT the setpoint
+    target), letting the indoor temperature drift naturally; cooling_off=True
+    flags this so the upper layer can stop tracking the setpoint that step.
     """
     r = others_ratio
-    P_cool = ((etp.k_IT + r) * P_IT - Q_DC) / (etp.k_cop - r)
-    P_cool = max(P_cool, 0.0)
-    P_others = r * (P_IT + P_cool)
-    return P_cool, P_others
+    P_cool = ((etp.k_IT + r) * P_IT - Q_DC_target) / (etp.k_cop - r)
+    if P_cool >= 0.0:
+        P_others = r * (P_IT + P_cool)
+        return CoolingResult(P_cool=P_cool, P_others=P_others,
+                             Q_DC=Q_DC_target, cooling_off=False)
+    # Chiller off: recompute the actual net heat under no-cooling conditions.
+    P_others = r * P_IT
+    Q_DC_natural = etp.k_IT * P_IT + P_others
+    return CoolingResult(P_cool=0.0, P_others=P_others,
+                         Q_DC=Q_DC_natural, cooling_off=True)
 
 
 def total_dc_power(P_IT: float, P_cool: float, P_others: float) -> float:

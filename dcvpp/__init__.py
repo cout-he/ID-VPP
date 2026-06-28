@@ -11,6 +11,7 @@ from .dc_load_model import (
     simulate_forward,
     q_dc_required,
     p_cool_from_q_dc,
+    CoolingResult,
     total_dc_power,
     steady_state_temp,
     q_dc_for_setpoint,
@@ -22,6 +23,6 @@ __all__ = [
     "build_recursion", "ETPRecursion",
     "p_it_from_utilisation", "p_it_from_workload", "p_it_full_load",
     "step_forward", "simulate_forward",
-    "q_dc_required", "p_cool_from_q_dc", "total_dc_power",
+    "q_dc_required", "p_cool_from_q_dc", "CoolingResult", "total_dc_power",
     "steady_state_temp", "q_dc_for_setpoint",
 ]

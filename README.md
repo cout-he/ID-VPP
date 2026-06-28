@@ -63,6 +63,23 @@ modal term to 0. The 1-hour sampling step therefore enters as `dt_h = 1.0`.
   (calibration anchor: ≤4 h).
 - Scenario B (summer day, setpoint-tracking cooling): indoor held at 24°C,
   `P_DC` 3.3–3.8 MW (< 4 MW cap), PUE 1.51–1.68 — physically realistic.
+- Scenario C (cold winter, 30% load): the inverse demands negative cooling, so
+  the chiller turns **off** (`P_cool=0`) and the indoor temp drifts naturally
+  (24 → 16.3 °C). Exiting the band here is *correct* model behaviour — the
+  heat-balance-consistent natural drift, not a clip — and is the DR/heating
+  trade-off space the Phase-5 optimiser resolves.
+
+### Modelling decisions & caveats
+See [`reproduction_notes.md`](reproduction_notes.md) for points where the paper
+is ambiguous and we chose a reading, notably:
+- `P_others` = 10% of **electrical** IT+cooling power (→ simultaneous solve of
+  `P_cool`/`P_others`; watch the `k_cop−0.1` denominator if `k_cop` is small).
+- Chiller-off uses natural recursion, never a `P_cool` clip (heat-balance
+  consistency).
+- Utilisation out of `[0, u_max]` (eq. 39) is **reported as a warning, never
+  silently clipped** — clipping would disguise an infeasible dispatch.
+- Scenario B's flat 24 °C is *imposed* (inverse model); emergent temperature
+  behaviour is a Phase-5 test.
 
 ## Next phases (planned)
 2. Workload model (eq. 4-5) + DR constraints (eq. 38-45).
